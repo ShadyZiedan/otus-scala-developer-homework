@@ -25,7 +25,16 @@ class UserDaoSlickImpl(db: Database)(implicit ec: ExecutionContext) {
     db.run(res)
   }
 
-  def createUser(user: User): Future[User] = ???
+  def createUser(user: User): Future[User] = {
+    val res = for {
+      id <- (users returning users.map(_.id)) += UserRow.fromUser(user.copy(id = None))
+      newUser <- users.filter(_.id === id).result.headOption
+      _ <- usersToRoles ++= user.roles.map(id -> _)
+//      roles <- usersToRoles.filter(_.usersId === id).result
+    } yield newUser.map(_.toUser(user.roles)).get
+
+    db.run(res.transactionally)
+  }
 
   def updateUser(user: User): Future[Unit] = {
     user.id match {
@@ -38,22 +47,40 @@ class UserDaoSlickImpl(db: Database)(implicit ec: ExecutionContext) {
         val deleteRoles = usersToRoles.filter(_.usersId === userId).delete
         val insertRoles = usersToRoles ++= user.roles.map(userId -> _)
 
-        val action = updateUser >> deleteRoles >> insertRoles >> DBIO.successful(())
-
-        db.run(action)
-      case None => Future.successful(())
+        val action = for {
+          updated <- updateUser
+          _ <- if (updated <= 0) (users += UserRow.fromUser(user)) else deleteRoles
+          _ <- insertRoles
+        } yield ()
+        db.run(action.transactionally)
+      case None => createUser(user).map(_ => ())
     }
+
   }
 
-  def deleteUser(userId: UUID): Future[Option[User]] = ???
+  def deleteUser(userId: UUID): Future[Option[User]] = {
+    val res = for {
+      user <- users.filter(_.id === userId).result.headOption
+      roles <- usersToRoles.filter(_.usersId === userId).result
+      _ <- usersToRoles.filter(_.usersId === userId).delete
+      _ <- users.filter(_.id === userId).delete
+    } yield user.map(_.toUser(roles.map(_._2).toSet))
+    db.run(res)
+  }
 
-  private def findByCondition(condition: Users => Rep[Boolean]): Future[Vector[User]] = ???
+  private def findByCondition(condition: Users => Rep[Boolean]): Future[Vector[User]] = {
+    val res = for {
+      rows <- users.filter(condition).result
+      roles <- usersToRoles.filter(_.usersId inSet rows.map(_.id.get)).result.map(_.toSet)
+    } yield rows.map(u => u.toUser(roles.collect{ case (uuid, role) if uuid == u.id.get => role}))
+    db.run(res.map(_.toVector))
+  }
 
-  def findByLastName(lastName: String): Future[Seq[User]] = ???
+  def findByLastName(lastName: String): Future[Seq[User]] = findByCondition(u => u.lastName === lastName)
 
-  def findAll(): Future[Seq[User]] = ???
+  def findAll(): Future[Seq[User]] = findByCondition(_ => true)
 
-  private[slick] def deleteAll(): Future[Unit] = ???
+  private[slick] def deleteAll(): Future[Unit] = db.run(users.delete.map(_ => ()))
 }
 
 object UserDaoSlickImpl {
